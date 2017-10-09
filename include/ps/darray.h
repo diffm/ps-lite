@@ -1,8 +1,10 @@
 /**
  *  Copyright (c) 2015 by Contributors
  */
-#ifndef PS_SARRAY_H_
-#define PS_SARRAY_H_
+#ifdef MXNET_USE_RDMA
+
+#ifndef PS_DARRAY_H_
+#define PS_DARRAY_H_
 #include <string.h>
 #include <string>
 #include <vector>
@@ -10,86 +12,92 @@
 #include <sstream>
 #include "ps/internal/utils.h"
 #include "ps/range.h"
-#include "ps/darray.h"
+#include "ps/internal/memory_allocator.h"
+#include "ps/internal/memory.h"
 namespace ps {
 
 template<typename V>
-class DArray;
+class SArray;
+
+#define GetMR() (Memory::GetMemory()->mr)
 
 /**
  * \brief Shared array
  *
  * A smart array that retains shared ownership. It provides similar
  * functionalities comparing to std::vector, including data(), size(),
- * operator[], resize(), clear(). SArray can be easily constructed from
+ * operator[], resize(), clear(). DArray can be easily constructed from
  * std::vector, such as
  *
  * \code
- * std::vector<int> a(10); SArray<int> b(a);  // copying
+ * std::vector<int> a(10); DArray<int> b(a);  // copying
  * std::shared_ptr<std::vector<int>> c(new std::vector<int>(10));
- * SArray<int> d(c);  // only pointer copying
+ * DArray<int> d(c);  // only pointer copying
  * \endcode
  *
- * SArray is also like a C pointer when copying and assigning, namely
+ * DArray is also like a C pointer when copying and assigning, namely
  * both copy are assign are passing by pointers. The memory will be release only
  * if there is no copy exists. It is also can be cast without memory copy, such as
  *
  * \code
- * SArray<int> a(10);
- * SArray<char> b(a);  // now b.size() = 10 * sizeof(int);
+ * DArray<int> a(10);
+ * DArray<char> b(a);  // now b.size() = 10 * sizeof(int);
  * \endcode
  *
  * \tparam V the value type
  */
 template<typename V>
-class SArray {
+class DArray {
  public:
   /** \brief empty constructor */
-  SArray() { }
+  DArray() { }
 
   /** \brief empty deconstrcutor */
-  ~SArray() { }
+  ~DArray() { }
 
   /**
    * \brief Create an array with length n with initialized value
    * \param size the length
    * \param val the initial length (0 in default)
    */
-  explicit SArray(size_t size, V val = 0) { resize(size, val); }
+  explicit DArray(size_t size, V val = 0) { resize(size, val); }
 
-  /**
-   * \brief construct from another SArray.
-   *
-   * Zero-copy constructor, namely just copy the pointer
-   *
-   * \tparam W the value type of the source array
-   * \param arr the source array
-   */
-  template <typename W>
-  explicit SArray(const SArray<W>& arr) { *this = arr; }
-
-  template <typename W>
-  explicit SArray(const DArray<W>& arr) { *this = arr; }
-  /**
-   * \brief construct from another SArray.
-   *
-   * Zero-copy constructor, namely just copy the pointer
-   *
-   * \tparam W the value type of the source array
-   * \param arr the source array
-   */
-  template <typename W> void operator=(const SArray<W>& arr) {
-    size_ = arr.size() * sizeof(W) / sizeof(V);
-    CHECK_EQ(size_ * sizeof(V), arr.size() * sizeof(W)) << "cannot be divided";
-    capacity_ = arr.capacity() * sizeof(W) / sizeof(V);
-    ptr_ = std::shared_ptr<V>(arr.ptr(), reinterpret_cast<V*>(arr.data()));
+  explicit DArray(const SArray<V> &arr) {
+    CopyFrom(arr.data(), arr.size());
   }
 
+  /**
+   * \brief Requests that the capacity be at least enough to contain n elements.
+   *
+   * Zero-copy constructor, namely just copy the pointer
+   *
+   * \tparam W the value type of the source array
+   * \param arr the source array
+   */
+  template <typename W>
+  explicit DArray(const DArray<W>& arr) { *this = arr; }
+
+  /**
+   * \brief construct from another DArray.
+   *
+   * Zero-copy constructor, namely just copy the pointer
+   *
+   * \tparam W the value type of the source array
+   * \param arr the source array
+   */
   template <typename W> void operator=(const DArray<W>& arr) {
     size_ = arr.size() * sizeof(W) / sizeof(V);
     CHECK_EQ(size_ * sizeof(V), arr.size() * sizeof(W)) << "cannot be divided";
     capacity_ = arr.capacity() * sizeof(W) / sizeof(V);
-    ptr_ = std::shared_ptr<V>(arr.ptr(), reinterpret_cast<V*>(arr.data()));
+
+    if (GetMR()->in_range(arr.data())) {
+      ptr_ = std::shared_ptr<V>(arr.ptr(), reinterpret_cast<V*>(arr.data()));
+    } else {
+      assert(0);
+      V *new_data = reinterpret_cast<V*>(GetMR()->Allocate(capacity_ * sizeof(V)));
+      memcpy(this->data(), arr.data(), size_ * sizeof(V));
+      reset(new_data, size_, [](V *data){ GetMR()->Deallocate(data); });
+    }
   }
 
   /**
@@ -103,11 +111,24 @@ class SArray {
    * count goes 0
    */
 
-  SArray(V* data, size_t size, bool deletable = false) {
+  DArray(V* data, size_t size, bool deletable = false) {
     if (deletable) {
-      reset(data, size, [](V* data){ delete [] data; });
+      /* TODO(cjr) here we may do one more copy */
+      if (GetMR()->in_range(data)) {
+        reset(data, size, [](V *data){ GetMR()->Deallocate(data); });
+      } else {
+        V *new_data = reinterpret_cast<V *>(GetMR()->Allocate(size * sizeof(V)));
+        memcpy(new_data, data, size * sizeof(V));
+        reset(new_data, size, [](V *data){ GetMR()->Deallocate(data); });
+      }
     } else {
-      reset(data, size, [](V* data) { });
+      if (GetMR()->in_range(data)) {
+        reset(data, size, [](V *data){ });
+      } else {
+        V *new_data = reinterpret_cast<V *>(GetMR()->Allocate(size * sizeof(V)));
+        memcpy(new_data, data, size * sizeof(V));
+        reset(new_data, size, [](V *data){ });
+      }
     }
   }
 
@@ -123,11 +144,11 @@ class SArray {
   }
 
   /**
-   * \brief copy from another SArray
+   * \brief copy from another DArray
    *
    * \param other the source data
    */
-  void CopyFrom(const SArray<V>& other) {
+  void CopyFrom(const DArray<V>& other) {
     if (this == &other) return;
     CopyFrom(other.data(), other.size());
   }
@@ -138,33 +159,36 @@ class SArray {
   template <typename ForwardIt>
   void CopyFrom(const ForwardIt& first, const ForwardIt& last) {
     int size = static_cast<int>(std::distance(first, last));
-    V* data = new V[size];
-    reset(data, size, [](V* data){ delete [] data; });
-    auto it = first;
-    while (size-- > 0) { *data = *it; ++data; ++it; }
+    V *data = reinterpret_cast<V *>(GetMR()->Allocate(size * sizeof(V)));
+    reset(data, size, [](V *data) { GetMR()->Deallocate(data); });
+    for (auto it = first; it < last; ++it) *data++ = *it;
   }
 
   /**
    * \brief construct from a std::vector, copy the data
    */
-  explicit SArray(const std::vector<V>& vec) { CopyFrom(vec.data(), vec.size()); }
+  explicit DArray(const std::vector<V>& vec) {
+    assert(0);
+    CopyFrom(vec.data(), vec.size());
+  }
 
   /**
    * \brief construct from a shared std::vector pinter, no data copy
    */
-  explicit SArray(const std::shared_ptr<std::vector<V>>& vec) {
-    ptr_ = std::shared_ptr<V>(vec, vec->data());
-    size_ = vec->size();
-    capacity_ = size_;
+  explicit DArray(const std::shared_ptr<std::vector<V>>& vec) {
+    assert(0);
+    CopyFrom(vec.begin(), vec.end());
   }
 
   /** @brief Copy from a initializer_list */
-  template <typename W> SArray(const std::initializer_list<W>& list) {
+  template <typename W> DArray(const std::initializer_list<W>& list) {
+    assert(0);
     CopyFrom(list.begin(), list.end());
   }
 
   /** @brief Copy from a initializer_list */
   template <typename W> void operator=(const std::initializer_list<W>& list) {
+    assert(0);
     CopyFrom(list.begin(), list.end());
   }
 
@@ -187,16 +211,17 @@ class SArray {
     if (capacity_ >= size) {
       size_ = size;
     } else {
-      V* new_data = new V[size+5];
-      memcpy(new_data, data(), size_*sizeof(V));
-      reset(new_data, size, [](V* data){ delete [] data; });
+      /* TODO(cjr) FIXME(cjr) when size * sizeof(V) >= REGION_SIZE*/
+      V *new_data = reinterpret_cast<V *>(GetMR()->Allocate((size + 5) * sizeof(V)));
+      memcpy(new_data, data(), size_ * sizeof(V));
+      reset(new_data, size, [](V *data){ GetMR()->Deallocate(data); });
     }
     if (size <= cur_n) return;
-    V* p = data() + cur_n;
+    V *p = data() + cur_n;
     if (val == 0) {
-      memset(p, 0, (size - cur_n)*sizeof(V));
+      memset(p, 0, (size - cur_n) * sizeof(V));
     } else {
-      for (size_t i = 0; i < size - cur_n; ++i) { *p = val; ++p; }
+      for (; cur_n < size; cur_n++) *p++ = val;
     }
   }
 
@@ -211,12 +236,13 @@ class SArray {
   }
 
   /** @brief release the memory */
-  void clear() { reset(nullptr, 0, [](V* data) {}); }
+  void clear() { reset(nullptr, 0, [](V *data) {}); }
 
 
   inline bool empty() const { return size() == 0; }
   inline size_t size() const { return size_; }
   inline size_t capacity() const { return capacity_; }
+  inline size_t bytesize() const { return size_ * sizeof(V); }
 
   inline V* begin() { return data(); }
   inline const V* begin() const { return data(); }
@@ -242,7 +268,8 @@ class SArray {
 
   void pop_back() { if (size_) --size_; }
 
-  void append(const SArray<V>& arr) {
+  /* TODO(cjr) Here we can use sglist? */
+  void append(const DArray<V>& arr) {
     if (arr.empty()) return;
     auto orig_size = size_;
     resize(size_ + arr.size());
@@ -257,9 +284,11 @@ class SArray {
    * @param end the end index segment
    * @return the segment [begin, end)
    */
-  SArray<V> segment(size_t begin, size_t end) const {
+  DArray<V> segment(size_t begin, size_t end) const {
     CHECK_GE(end, begin); CHECK_LE(end, size());
-    SArray<V> ret;
+    DArray<V> ret;
+    /* TODO(cjr) check correctness of this function */
+    assert(0);
     ret.ptr_ = std::shared_ptr<V>(ptr_, data() + begin);
     ret.size_ = end - begin;
     ret.capacity_ = end - begin;
@@ -280,7 +309,7 @@ class SArray {
  *
  * An example
  * \code{cpp}
- * SArray<int> a{1 3 5 7 9};
+ * DArray<int> a{1 3 5 7 9};
  * CHECK_EQ(Range(1,3), FindRange(a, 2, 7);
  * \endcode
  *
@@ -291,37 +320,23 @@ class SArray {
  * \return the index range
  */
 template<typename V>
-Range FindRange(const SArray<V>& arr, V lower, V upper) {
+Range FindRange(const DArray<V>& arr, V lower, V upper) {
   if (upper <= lower) return Range(0, 0);
   auto lb = std::lower_bound(arr.begin(), arr.end(), lower);
   auto ub = std::lower_bound(arr.begin(), arr.end(), upper);
   return Range(lb - arr.begin(), ub - arr.begin());
 }
 
-
-/*! \brief returns a short debug string */
-template <typename V>
-inline std::string DebugStr(const V* data, int n, int m = 5) {
-  std::stringstream ss;
-  ss << "[" << n << "]: ";
-  if (n < 2 * m) {
-    for (int i = 0; i < n; ++i) ss << data[i] << " ";
-  } else {
-    for (int i = 0; i < m; ++i) ss << data[i] << " ";
-    ss << "... ";
-    for (int i = n-m; i < n; ++i) ss << data[i] << " ";
-  }
-  return ss.str();
-}
-
 /**
  * \brief print a debug string
  */
 template <typename V>
-std::ostream& operator<<(std::ostream& os, const SArray<V>& obj) {
+std::ostream& operator<<(std::ostream& os, const DArray<V>& obj) {
   os << DebugStr(obj.data(), obj.size());
   return os;
 }
 
 }  // namespace ps
-#endif  // PS_SARRAY_H_
+#endif  // PS_DARRAY_H_
+
+#endif  // MXNET_USE_RDMA
