@@ -1,6 +1,4 @@
 #include "ps/ps.h"
-#include <cmath>
-
 using namespace ps;
 
 void StartServer() {
@@ -10,9 +8,10 @@ void StartServer() {
   RegisterExitCallback([server](){ delete server; });
 }
 
-void RunWorker() {
+void RunWorker(int customer_id) {
   if (!IsWorker()) return;
-  KVWorker<float> kv(0, 0);
+  Start(customer_id);
+  KVWorker<float> kv(0, customer_id);
 
   // init
   int num = 10000;
@@ -22,10 +21,9 @@ void RunWorker() {
   int rank = MyRank();
   srand(rank + 7);
   for (int i = 0; i < num; ++i) {
-    keys[i] = kMaxKey / num * i + rank;
+    keys[i] = kMaxKey / num * i + customer_id;
     vals[i] = (rand() % 1000);
   }
-
   // push
   int repeat = 50;
   std::vector<int> ts;
@@ -43,20 +41,27 @@ void RunWorker() {
 
   float res = 0;
   for (int i = 0; i < num; ++i) {
-    res += std::fabs(rets[i] - vals[i] * repeat);
+    res += fabs(rets[i] - vals[i] * repeat);
   }
   CHECK_LT(res / repeat, 1e-5);
   LL << "error: " << res / repeat;
+  // stop system
+  Finalize(customer_id, true);
 }
 
 int main(int argc, char *argv[]) {
   // setup server nodes
   StartServer();
   // start system
-  Start(0);
+  if (!IsWorker()) {
+    Start(0);
+    Finalize(0, true);
+  }
   // run worker nodes
-  RunWorker();
-  // stop system
-  Finalize(0, true);
+  std::thread t0(RunWorker, 0);
+  std::thread t1(RunWorker, 1);
+
+  t0.join();
+  t1.join();
   return 0;
 }
