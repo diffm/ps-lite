@@ -92,13 +92,13 @@ public:
     ~RDMAVan() { }
 
 protected:
-    void Start() override {
+    void Start(int customer_id) override {
         event_channel_ = rdma_create_event_channel();
         CHECK(event_channel_)
             << "create RDMA event channel failed";
         event_poller_should_stop_ = false;
         rdma_cm_event_poller_thread_ = new std::thread(&RDMAVan::OnEvent, this);
-        Van::Start();
+        Van::Start(customer_id);
     }
 
     void Stop() override {
@@ -373,7 +373,7 @@ protected:
                         << "apply for length: " << length;
 
                     conn->send_msg->data.mr.addr[i] =
-                        reinterpret_cast<char *>(Memory::GetMemory()->ptr + offset);
+                        reinterpret_cast<char *>(Memory::GetMemory()->ptr) + offset;
                 }
                 conn->send_msg->data.mr.rkey = context_->rdma_mr->rkey;
                 PostSendRDMAMsg(conn, IBV_SEND_SIGNALED);
