@@ -5,6 +5,7 @@
 #define PS_ZMQ_VAN_H_
 #include <zmq.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <thread>
 #include <string>
 #include "ps/internal/van.h"
@@ -146,11 +147,13 @@ class ZMQVan : public Van {
     // zmq_msg_close(&meta_msg);
     int send_bytes = meta_size;
 
+    printf("TCP In SendMsg, meta, addr = %p, len = %d\n", meta_buf, meta_size);
     // send data
     for (int i = 0; i < n; ++i) {
       zmq_msg_t data_msg;
       SArray<char>* data = new SArray<char>(msg.data[i]);
       int data_size = data->size();
+      printf("TCP In SendMsg, msg %d, addr = %p, len = %d\n", i + 1, data->data(), data_size);
       zmq_msg_init_data(&data_msg, data->data(), data->size(), FreeData, data);
       if (i == n - 1) tag = 0;
       while (true) {
