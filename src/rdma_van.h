@@ -92,12 +92,11 @@ static inline uint16_t checksum(uint16_t *addr, int count) {
     count -= 2;
   }
   if (count > 0) {
-    char left_over[2] {0};
+    char left_over[2]{0};
     left_over[0] = *addr;
     sum += *(uint16_t *)(void *)left_over;
   }
-  while (sum >> 16)
-    sum = (sum & 0xffff) + (sum >> 16);
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
   return ~sum;
 }
 
@@ -342,16 +341,18 @@ class RDMAVan : public Van {
     int sge_idx = 1;
     for (size_t i = 0; i < msg.data.size(); i++) {
       /* TODO(cjr) check allocate and delete srmem, restructure the code, change NICAllocator */
-      //SRMem<char> srmem(msg.data[i]);
+      // SRMem<char> srmem(msg.data[i]);
 
       header->length[i + 1] = msg.data[i].size();
       total_length += msg.data[i].size();
 
-      //inspect(msg.data[i].data(), msg.data[i].size());
+      // inspect(msg.data[i].data(), msg.data[i].size());
       if (msg.data[i].size() == 0) continue;
 
       srmem_vec.push_back(SRMem<char>(msg.data[i]));
       auto &srmem = *srmem_vec.rbegin();
+      //srmem_vec.push_back(std::make_shared<SRMem<char>>(SRMem<char>(msg.data[i])));
+      //auto srmem = srmem_vec.rbegin()->get();
 
       CHECK_EQ(srmem.size(), msg.data[i].size()) << "srmem出了点什么问题";
 
@@ -404,8 +405,6 @@ class RDMAVan : public Van {
     }
 
     conn->sr_slots--;
-
-    // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     return send_bytes;
   }
 
@@ -510,19 +509,6 @@ class RDMAVan : public Van {
     }
   }
 
-  template <typename V>
-  struct SRMemDeleter {
-    SRMemDeleter(V *head, int count) : head(head), ref_count(count) {}
-    void operator()(V *data) {
-      if (--ref_count == 0) {
-        printf("head = %p\n", head); fflush(stdout);
-        NICAllocator::GetNICAllocator()->Deallocate(head);
-      }
-    }
-    void *head;
-    int ref_count = 0;
-  };
-
   int RecvMsg(Message *msg) override {
     size_t recv_bytes = 0;
     struct rdma_write_header *header;
@@ -539,8 +525,10 @@ class RDMAVan : public Van {
 
     uint16_t chksum = header->checksum;
     header->checksum = 0;
-    uint16_t temp = checksum(reinterpret_cast<uint16_t *>(addr), sizeof(*header) + header->length[0]);
-    CHECK_EQ(chksum, temp) << "chksum = " << chksum << " " << "temp = " << temp;
+    uint16_t temp =
+        checksum(reinterpret_cast<uint16_t *>(addr), sizeof(*header) + header->length[0]);
+    CHECK_EQ(chksum, temp) << "chksum = " << chksum << " "
+                           << "temp = " << temp;
 
     msg->meta.sender = header->sender;
     msg->meta.recver = my_node_.id;
@@ -554,7 +542,8 @@ class RDMAVan : public Van {
     for (int i = 1; header->length[i] != -1; i++)
       if (header->length[i] > 0) ref_count++;
 
-    SRMemDeleter<char> deleter(reinterpret_cast<char *>(header), ref_count);
+    /* TODO(cjr) pool this ref variable */
+    int *ref = new int(ref_count);
     // Zero-copy receiving
     for (int i = 1; header->length[i] != -1; i++) {
       addr = static_cast<char *>(addr) + header->length[i - 1];
@@ -567,7 +556,14 @@ class RDMAVan : public Van {
         SArray<char> sarray(static_cast<char *>(addr), 0);
         msg->data.push_back(sarray);
       } else {
-        SRMem<char> srmem(static_cast<char *>(addr), header->length[i], deleter);
+        /* TODO the SRMem here is not needful */
+        SRMem<char> srmem(static_cast<char *>(addr), header->length[i], [ref, header](char *data) {
+          printf("ref = %d, header = %p\n", *ref, header); fflush(stdout);
+          if (--(*ref) == 0) {
+            NICAllocator::GetNICAllocator()->Deallocate(header);
+            delete ref;
+          }
+        });
         SArray<char> sarray(srmem);
         msg->data.push_back(sarray);
       }
