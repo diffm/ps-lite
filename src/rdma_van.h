@@ -27,7 +27,7 @@ namespace ps {
 
 #include <chrono>
 
-//#define RDEBUG
+#define RDEBUG
 
 #ifdef RDEBUG
 #define debug(format, ...)                                                             \
@@ -43,9 +43,9 @@ namespace ps {
 #endif
 
 #ifdef RDEBUG
-void inspect(void *addr, int length) {
+void __inspect(const char *func, void *addr, int length) {
   char *ptr = (char *)addr;
-  printf("In inspect, addr = %p, length = %d\n", addr, length);
+  printf("[%s] In inspect, addr = %p, length = %d\n", func, addr, length);
   fflush(stdout);
   for (int i = 0; i < length; i++) {
     printf("%.2hhx ", ptr[i] & 0xff);
@@ -53,11 +53,15 @@ void inspect(void *addr, int length) {
       printf("\n");
       fflush(stdout);
     }
+    if (i >= 1024) {
+      printf("... ..."); fflush(stdout);
+      break;
+    }
   }
   printf("\n");
   fflush(stdout);
 }
-#define inspect(...) inspect(__VA_ARGS__)
+#define inspect(addr, length) __inspect(__func__, addr, length)
 #else
 #define inspect(...)
 #endif
@@ -346,8 +350,6 @@ class RDMAVan : public Van {
       header->length[i + 1] = msg.data[i].size();
       total_length += msg.data[i].size();
 
-      // inspect(msg.data[i].data(), msg.data[i].size());
-      if (msg.data[i].size() == 0) continue;
 
       srmem_vec.push_back(SRMem<char>(msg.data[i]));
       auto &srmem = *srmem_vec.rbegin();
@@ -356,6 +358,9 @@ class RDMAVan : public Van {
 
       CHECK_EQ(srmem.size(), msg.data[i].size()) << "srmem出了点什么问题";
 
+      //inspect(msg.data[i].data(), msg.data[i].size());
+      inspect(srmem.data(), srmem.size());
+      if (msg.data[i].size() == 0) continue;
       uint32_t lkey = context_->rdma_mr->lkey;
 
       if (NICAllocator::GetNICAllocator()->registered(srmem.data(), 0))
@@ -398,11 +403,14 @@ class RDMAVan : public Van {
         debug("recver_id = %d, stage: client receive WRITE_DONE message, imm_data = %d", recver_id,
               ntohl(wc.imm_data));
     } while (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM);
-
+    
     if (--conn->rr_slots <= 1) {
       PostRecvRDMAMsg(conn, kRxDepth - conn->rr_slots);
       conn->rr_slots = kRxDepth;
     }
+    //if (msg.data.size() == 2) {
+    //  inspect(srmem_vec[0].data(), srmem_vec[0].size());
+    //}
 
     conn->sr_slots--;
     return send_bytes;
@@ -496,6 +504,9 @@ class RDMAVan : public Van {
         conn->send_msg->data.imm_data = static_cast<uint32_t>(recv_addr_.size());
         recv_addr_.push_back(conn->send_msg->data.mr.addr);
 
+        if (total_length >= 400000)
+          inspect(conn->send_msg->data.mr.addr + sizeof(struct rdma_write_header) + data.length[0], 1024);
+
         debug("stage: server SEND MSG_RES_REGION, total_length = %d, imm_data = %u, addr = %p",
               total_length, conn->send_msg->data.imm_data, conn->send_msg->data.mr.addr);
 
@@ -557,14 +568,15 @@ class RDMAVan : public Van {
         msg->data.push_back(sarray);
       } else {
         /* TODO the SRMem here is not needful */
-        SRMem<char> srmem(static_cast<char *>(addr), header->length[i], [ref, header](char *data) {
-          printf("ref = %d, header = %p\n", *ref, header); fflush(stdout);
-          if (--(*ref) == 0) {
-            NICAllocator::GetNICAllocator()->Deallocate(header);
-            delete ref;
-          }
-        });
-        SArray<char> sarray(srmem);
+        //SRMem<char> srmem(static_cast<char *>(addr), header->length[i], [ref, header](char *data) {
+        //  if (--(*ref) == 0) {
+        //    printf("ref = %d, header = %p\n", *ref, header); fflush(stdout);
+        //    NICAllocator::GetNICAllocator()->Deallocate(header);
+        //    delete ref;
+        //  }
+        //});
+        //SArray<char> sarray(srmem);
+        SArray<char> sarray(static_cast<char *>(addr), header->length[i]);
         msg->data.push_back(sarray);
       }
 
