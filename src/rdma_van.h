@@ -43,7 +43,9 @@ namespace ps {
 #endif
 
 #ifdef RDEBUG
+std::mutex fuck_mutex_;
 void __inspect(const char *func, void *addr, int length) {
+  std::lock_guard<std::mutex> lock(fuck_mutex_);
   char *ptr = (char *)addr;
   printf("[%s] In inspect, addr = %p, length = %d\n", func, addr, length);
   fflush(stdout);
@@ -326,6 +328,7 @@ class RDMAVan : public Van {
 
     int total_length = srmem.size();
     struct ibv_sge sg_list[5];
+    //memset(sg_list, 0, sizeof(sg_list));
     struct ibv_send_wr wr, *bad_wr = nullptr;
 
     memset(&wr, 0, sizeof(wr));
@@ -349,7 +352,6 @@ class RDMAVan : public Van {
 
       header->length[i + 1] = msg.data[i].size();
       total_length += msg.data[i].size();
-
 
       srmem_vec.push_back(SRMem<char>(msg.data[i]));
       auto &srmem = *srmem_vec.rbegin();
@@ -376,6 +378,10 @@ class RDMAVan : public Van {
 
     wr.sg_list = sg_list;
     wr.num_sge = sge_idx;
+
+    for (int i = 0; i < wr.num_sge; i++) {
+      debug("sg_list{addr = 0x%lx, length = %d, lkey = %u}\n", wr.sg_list[i].addr, wr.sg_list[i].length, wr.sg_list[i].lkey);
+    }
 
     if (total_length <= conn->max_inline_data) wr.send_flags |= IBV_SEND_INLINE;
 
@@ -409,7 +415,8 @@ class RDMAVan : public Van {
       conn->rr_slots = kRxDepth;
     }
     //if (msg.data.size() == 2) {
-    //  inspect(srmem_vec[0].data(), srmem_vec[0].size());
+    //  printf("%d\n", wr.num_sge); fflush(stdout);
+    //  inspect((void *)wr.sg_list[1].addr, 1025);
     //}
 
     conn->sr_slots--;
@@ -460,10 +467,16 @@ class RDMAVan : public Van {
         conn->sr_slots--;
         CHECK_NE(wc.wc_flags & IBV_WC_WITH_IMM, 0) << "In PollCQ WITH_IMM, some error happen";
 
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
         uint32_t imm_data = ntohl(wc.imm_data);
         debug("stage: server RECV_WIRTE_WITH_IMM, imm_data = %u, addr = %p", imm_data,
               recv_addr_[imm_data]);
         write_done_queue_.Push(recv_addr_[imm_data]);
+
+        //struct rdma_write_header *header = (struct rdma_write_header *)(void *)recv_addr_[imm_data];
+        //if (header->length[1] >= 400000)
+        //  inspect(recv_addr_[imm_data] + sizeof(struct rdma_write_header) + header->length[0], 1025);
 
         if (--conn->rr_slots <= 1) {
           PostRecvRDMAMsg(conn, kRxDepth - conn->rr_slots);
@@ -504,8 +517,8 @@ class RDMAVan : public Van {
         conn->send_msg->data.imm_data = static_cast<uint32_t>(recv_addr_.size());
         recv_addr_.push_back(conn->send_msg->data.mr.addr);
 
-        if (total_length >= 400000)
-          inspect(conn->send_msg->data.mr.addr + sizeof(struct rdma_write_header) + data.length[0], 1024);
+        //if (total_length >= 400000)
+          //inspect(conn->send_msg->data.mr.addr + sizeof(struct rdma_write_header) + data.length[0], 1024);
 
         debug("stage: server SEND MSG_RES_REGION, total_length = %d, imm_data = %u, addr = %p",
               total_length, conn->send_msg->data.imm_data, conn->send_msg->data.mr.addr);
