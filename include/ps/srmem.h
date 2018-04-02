@@ -67,14 +67,20 @@ class SRMem {
    */
   explicit SRMem(const SArray<V>& arr) {
     /* when the copy cost is less than doing ibv_reg_mr, copy it */
-    if (arr.size() >= 16384 && !GetAllocator()->in_range(arr.data(), arr.size())) {
-      GetAllocator()->Register(arr.data(), arr.size());
-    }
+    //if (arr.size() >= 16384 && !GetAllocator()->in_range(arr.data(), arr.size())) {
+    //  GetAllocator()->Register(arr.data(), arr.size());
+    //}
     if (arr.size() >= 16384) {
+      GetAllocator()->Register(arr.data(), arr.size());
       reset(arr.data(), arr.size(), [](V* data) {});
     } else {
       CopyFrom(arr.data(), arr.size());
     }
+  }
+
+  template <typename Deleter>
+  explicit SRMem(V *data, size_t size, Deleter deleter) {
+    reset(data, size, deleter);
   }
 
   /**

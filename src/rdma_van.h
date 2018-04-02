@@ -54,7 +54,7 @@ struct rdma_msg {
     struct {
       /* MSG_RES_REGION */
       struct {
-        void *addr[5];
+        void *addr;
         uint32_t rkey;
       } mr;
       /* MSG_WRITE_DONE */
@@ -191,9 +191,8 @@ class RDMAVan : public Van {
     sge->lkey = lkey;
   }
 
-  void WriteToPeer(struct connection *conn, int recver, const SRMem<char> &srmem, void *addr,
-                   uint32_t rkey, uint32_t lkey) {
-    struct ibv_sge sge;
+  void WriteToPeer(struct connection *conn, int recver, struct ibv_sge *sg_list, int num_sge,
+                   void *addr, uint32_t rkey) {
     struct ibv_send_wr wr, *bad_wr = nullptr;
 
     memset(&wr, 0, sizeof(wr));
@@ -201,20 +200,18 @@ class RDMAVan : public Van {
     // wr.wr_id = (uintptr_t)conn;
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.next = nullptr;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
+    wr.sg_list = sg_list;
+    wr.num_sge = num_sge;
     wr.wr.rdma.remote_addr = (uintptr_t)addr;
     wr.wr.rdma.rkey = rkey;
     wr.send_flags = IBV_SEND_SIGNALED;
-
-    make_sge(&sge, srmem.data(), srmem.size(), lkey);
 
     /* Post Write Request */
     while (conn->sr_slots >= kTxDepth - 1) {
     }
     conn->sr_slots++;
-    CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0)
-        << "RDMA post send failed with errno: " << errno;
+    CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "RDMA post send failed with errno: "
+                                                      << errno;
 
     /* Poll RDMA_WRITE Completion */
     int ret;
@@ -270,8 +267,8 @@ class RDMAVan : public Van {
     struct ibv_wc wc;
     PollRDMAMsg(conn->cq, &wc);
 
-    CHECK(conn->recv_msg->type == MSG_RES_REGION)
-        << "receive message type != MSG_RES_REGION, " << conn->recv_msg->type;
+    CHECK(conn->recv_msg->type == MSG_RES_REGION) << "receive message type != MSG_RES_REGION, "
+                                                  << conn->recv_msg->type;
     conn->sr_slots--;
 
     /* 3. Send the data using RDMA_WRITE */
@@ -283,23 +280,30 @@ class RDMAVan : public Van {
     header->recver = recver_id;
     header->length[0] = meta_size;
 
+    struct ibv_sge sg_list[5];
+
     SRMem<char> srmem(meta_size);
     meta.SerializeToArray(srmem.data(), meta_size);
-    WriteToPeer(conn, recver_id, srmem, conn->recv_msg->data.mr.addr[0],
-                conn->recv_msg->data.mr.rkey, context_->rdma_mr->lkey);
+    make_sge(sg_list, srmem.data(), meta_size, context_->rdma_mr->lkey);
+
+    std::vector<SRMem<char>> srmem_vec;
 
     for (size_t i = 0; i < msg.data.size(); i++) {
       /* This should be tune further */
-      SRMem<char> srmem(msg.data[i]);
+      srmem_vec.push_back(SRMem<char>(msg.data[i]));
+      auto &srmem = *srmem_vec.rbegin();
       uint32_t lkey = context_->rdma_mr->lkey;
       if (NICAllocator::GetNICAllocator()->registered(srmem.data(), 0))
         lkey = NICAllocator::GetNICAllocator()->mr(srmem.data())->lkey;
-      WriteToPeer(conn, recver_id, srmem, conn->recv_msg->data.mr.addr[i + 1],
-                  conn->recv_msg->data.mr.rkey, lkey);
+
+      make_sge(sg_list + i + 1, srmem.data(), srmem.size(), lkey);
 
       header->length[i + 1] = msg.data[i].size();
     }
     header->length[msg.data.size() + 1] = -1;
+
+    WriteToPeer(conn, recver_id, sg_list, msg.data.size() + 1, conn->recv_msg->data.mr.addr,
+                conn->recv_msg->data.mr.rkey);
 
     /* 4. Notify remote side WRITE_DONE */
     conn->send_msg->type = MSG_WRITE_DONE;
@@ -322,8 +326,8 @@ class RDMAVan : public Van {
       }
     } while (1);
 
-    CHECK(conn->recv_msg->type == MSG_WRITE_DONE)
-        << "type != WRITE_DONE, bug" << conn->recv_msg->type;
+    CHECK(conn->recv_msg->type == MSG_WRITE_DONE) << "type != WRITE_DONE, bug"
+                                                  << conn->recv_msg->type;
 
     conn->sr_slots--;
 
@@ -360,10 +364,11 @@ class RDMAVan : public Van {
         conn->send_msg->type = MSG_RES_REGION;
         auto &data = conn->recv_msg->data;
 
+        int total_length = 0;
         for (int i = 0, length; (length = data.length[i]) != -1; i++) {
-          if (length == 0) length = 256;
-          conn->send_msg->data.mr.addr[i] = NICAllocator::GetNICAllocator()->Allocate(length);
+          total_length += length;
         }
+        conn->send_msg->data.mr.addr = NICAllocator::GetNICAllocator()->Allocate(total_length);
         conn->send_msg->data.mr.rkey = context_->rdma_mr->rkey;
         PostSendRDMAMsg(conn, IBV_SEND_SIGNALED);
 
@@ -385,27 +390,38 @@ class RDMAVan : public Van {
 
     msg->data.clear();
 
+    void *head;
     void *addr;
 
     write_done_queue_.WaitAndPop(&recv_msg);
 
     /* handle message meta */
-    addr = recv_msg.data.mr.addr[0];
+    head = addr = recv_msg.data.mr.addr;
 
     header = &recv_msg.data.header;
     msg->meta.sender = header->sender;
     msg->meta.recver = my_node_.id;
 
     UnpackMeta(static_cast<char *>(addr), header->length[0], &msg->meta);
-    NICAllocator::GetNICAllocator()->Deallocate(addr);
 
     recv_bytes += header->length[0];
 
+    int *ref = new int(0);
+    for (int i = 1; header->length[i] != -1; i++) (*ref)++;
+
     // Zero-copy receiving
     for (int i = 1; header->length[i] != -1; i++) {
-      addr = recv_msg.data.mr.addr[i];
-      SRMem<char> srmem(static_cast<char *>(addr), header->length[i], true);
-      SArray<char> sarray(srmem);
+      addr = (char *)addr + header->length[i - 1];
+      SRMem<char> srmem(static_cast<char *>(addr), header->length[i], [ref, head](char *data) {
+        if (--(*ref) == 0) {
+          NICAllocator::GetNICAllocator()->Deallocate(head);
+          delete ref;
+        }
+      });
+      //SArray<char> sarray(srmem);
+      //SArray<char> sarray((char *)addr, header->length[i]);
+      SArray<char> sarray;
+      sarray.CopyFrom((char *)addr, header->length[i]);
       msg->data.push_back(sarray);
 
       recv_bytes += header->length[i];
@@ -552,8 +568,8 @@ class RDMAVan : public Van {
     while (conn->sr_slots >= kTxDepth - 1) {
     }
     conn->sr_slots++;
-    CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0)
-        << "send RDMA message failed with errno: " << errno;
+    CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "send RDMA message failed with errno: "
+                                                      << errno;
   }
 
   void PostRecvRDMAMsg(struct connection *conn, int n) {
@@ -571,8 +587,8 @@ class RDMAVan : public Van {
     sge.lkey = conn->recv_msg_mr->lkey;
 
     for (int i = 0; i < n; i++)
-      CHECK(ibv_post_recv(conn->qp, &wr, &bad_wr) == 0)
-          << "post receive MSG failed with errno: " << errno;
+      CHECK(ibv_post_recv(conn->qp, &wr, &bad_wr) == 0) << "post receive MSG failed with errno: "
+                                                        << errno;
   }
 
   void PollRDMAMsg(struct ibv_cq *cq, struct ibv_wc *wc) {
