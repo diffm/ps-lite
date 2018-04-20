@@ -18,6 +18,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 
 #include "ps/internal/allocator.h"
 #include "ps/internal/threadsafe_queue.h"
@@ -46,7 +47,6 @@ namespace ps {
 #ifdef RDEBUG
 std::mutex _inspect_mutex;
 static inline void __inspect(const char *func, void *addr, int length) {
-  return;
   std::lock_guard<std::mutex> lock(_inspect_mutex);
   char *ptr = (char *)addr;
   printf("[%s] In inspect, addr = %p, length = %d\n", func, addr, length);
@@ -72,7 +72,7 @@ static inline void __inspect(const char *func, void *addr, int length) {
 #endif
 
 const int kRxDepth = 500;
-const int kTxDepth = 500;
+const int kTxDepth = 2;
 const int kSGEntry = 4;
 const int kTimeoutms = 1000;
 const int kInlineData = 4000;
@@ -130,7 +130,9 @@ struct connection {
 
   /* TODO(cjr) remove volatile */
   /* TODO(cjr) move these to struct context */
-  volatile int sr_slots, rr_slots;
+  //volatile int sr_slots, rr_slots;
+  std::atomic<int> sr_slots;
+  int rr_slots;
 
   struct rdma_msg *send_msg;
   struct rdma_msg *recv_msg;
@@ -244,6 +246,7 @@ class RDMAVan : public Van {
     while (!IsConnected(conn)) {
     }
 
+    debug("node_id = %d\n", node_id);
     connections_[node_id].push_back(id);
     LOG(INFO) << "Connected to node: " << node_id;
   }
@@ -262,6 +265,7 @@ class RDMAVan : public Van {
     int recver_id = msg.meta.recver;
     CHECK_NE(recver_id, Meta::kEmpty);
 
+    debug("recver_id = %d\n", recver_id);
     auto it = connections_.find(recver_id);
     if (it == connections_.end()) {
       LOG(WARNING) << "there is no socket to node: " << recver_id;
@@ -321,6 +325,7 @@ class RDMAVan : public Van {
     send_queue_.push_back((struct send_msg_step2){msg, {}});
     PostSendRDMAMsg(conn, send_flags, htonl(send_queue_.size() - 1));
 
+    //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     return send_bytes;
   }
 
@@ -330,9 +335,13 @@ class RDMAVan : public Van {
     Message &msg = ele.msg;
     PBMeta meta;
     PackMetaPB(msg.meta, &meta);
-    size_t meta_size = meta.ByteSize();
+    uint32_t meta_size = meta.ByteSize();
+    size_t send_bytes = meta_size + msg.meta.data_size;
 
     const size_t header_size = sizeof(struct rdma_write_header);
+    if (header_size + send_bytes <= kInlineData)
+      return;
+
     SRMem<char> *srmem = new SRMem<char>(meta_size + header_size);
     ele.srmem_list.push_back(srmem);
     meta.SerializeToArray(srmem->data() + header_size, meta_size);
@@ -344,7 +353,7 @@ class RDMAVan : public Van {
     header->recver = msg.meta.recver;
     header->length[0] = meta_size;
 
-    inspect(srmem->data(), srmem->size());
+    //inspect(srmem->data(), srmem->size());
 
     int total_length = meta_size + header_size;
     struct ibv_sge sg_list[5];
@@ -368,7 +377,7 @@ class RDMAVan : public Van {
       header->length[i + 1] = msg.data[i].size();
       total_length += msg.data[i].size();
 
-      inspect(msg.data[i].data(), msg.data[i].size());
+      //inspect(msg.data[i].data(), msg.data[i].size());
 
       if (msg.data[i].size() == 0) continue;
 
@@ -396,9 +405,9 @@ class RDMAVan : public Van {
         "recver_id = %d, stage: client WRITE_WITH_IMM, msg_num = %ld, total_length = %d, "
         "imm_data "
         "= %u, sr_slots = %d, conn = %p",
-        111, msg.data.size(), total_length, ntohl(wr.imm_data), conn->sr_slots, conn);
+        111, msg.data.size(), total_length, ntohl(wr.imm_data), conn->sr_slots.load(), conn);
 
-    while (conn->sr_slots >= kTxDepth - 1) {
+    while (conn->sr_slots.load() >= kTxDepth - 1) {
     }
     conn->sr_slots++;
     CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "RDMA post send failed with errno: "
@@ -409,6 +418,7 @@ class RDMAVan : public Van {
     // local send done
     if (wc.opcode == IBV_WC_SEND) {
       conn->sr_slots--;
+      debug("conn->sr_slots = %d\n", conn->sr_slots.load());
       return;
     }
 
@@ -453,7 +463,7 @@ class RDMAVan : public Van {
   void RecverCQHandler(struct connection *conn, struct ibv_wc &wc) {
     if (wc.opcode == IBV_WC_RDMA_WRITE) {
       conn->sr_slots--;
-      debug("stage: server WRITE_WITH_IMM done, conn = %p, sr_slots = %d\n", conn, conn->sr_slots);
+      debug("stage: server WRITE_WITH_IMM done, conn = %p, sr_slots = %d\n", conn, conn->sr_slots.load());
       return;
     }
 
@@ -495,7 +505,7 @@ class RDMAVan : public Van {
       wr.imm_data = htonl(wc.imm_data & 0xffff);
 
       wr.wr_id = (uintptr_t)conn;
-      while (conn->sr_slots >= kTxDepth - 1) {
+      while (conn->sr_slots.load() >= kTxDepth - 1) {
       }
       conn->sr_slots++;
       CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0)
@@ -770,7 +780,7 @@ class RDMAVan : public Van {
     sge.length = conn->send_msg->size;
     sge.lkey = conn->send_msg_mr->lkey;
 
-    while (conn->sr_slots >= kTxDepth - 1) {
+    while (conn->sr_slots.load() >= kTxDepth - 1) {
     }
     conn->sr_slots++;
     CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "send RDMA message failed with errno: "
