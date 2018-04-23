@@ -27,7 +27,7 @@ namespace ps {
 
 #include <chrono>
 
-#define RDEBUG
+//#define RDEBUG
 
 #ifdef RDEBUG
 #define debug(format, ...)                                                             \
@@ -150,9 +150,6 @@ struct connection {
 
   struct {
     Message *msg;
-    Message *msg_copy;
-    PBMeta *pbmeta;
-    PBMeta *pbmeta_copy;
     SRMem<char> *srmem_arr[5];
   } upintheair;
 };
@@ -299,7 +296,7 @@ class RDMAVan : public Van {
     *conn->upintheair.msg = msg;
     memset(conn->upintheair.srmem_arr, 0, sizeof(conn->upintheair.srmem_arr));
 
-    PBMeta &meta = *conn->upintheair.pbmeta;
+    PBMeta meta;
     PackMetaPB(msg.meta, &meta);
     uint32_t meta_size = meta.ByteSize();
     size_t send_bytes = meta_size + msg.meta.data_size;
@@ -368,18 +365,14 @@ class RDMAVan : public Van {
 
     const size_t header_size = sizeof(struct rdma_write_header);
 
-    PBMeta &meta = *conn->upintheair.pbmeta_copy;
+    Message &msg = *conn->upintheair.msg;
+    PBMeta meta;
+    PackMetaPB(msg.meta, &meta);
     uint32_t meta_size = meta.ByteSize();
-    Message &msg = *conn->upintheair.msg_copy;
 
     /* the data is directly sent with RDMA_SEND */
-    if (meta_size + header_size + msg.meta.data_size <= kInlineData) {
-      conn->mu->lock();
-      conn->flag = 1;
-      conn->mu->unlock();
-      conn->cond->notify_all();
+    if (meta_size + header_size + msg.meta.data_size <= kInlineData)
       return;
-    }
 
     SRMem<char> *srmem = new SRMem<char>(meta_size + header_size);
     meta.SerializeToArray(srmem->data() + header_size, meta_size);
@@ -402,9 +395,9 @@ class RDMAVan : public Van {
 
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.next = nullptr;
-    wr.wr.rdma.remote_addr = (uintptr_t)conn->recv_msg_copy.data.mr.addr;
-    wr.wr.rdma.rkey = conn->recv_msg_copy.data.mr.rkey;
-    wr.imm_data = htonl(conn->recv_msg_copy.data.mr.imm_data);
+    wr.wr.rdma.remote_addr = (uintptr_t)conn->recv_msg->data.mr.addr;
+    wr.wr.rdma.rkey = conn->recv_msg->data.mr.rkey;
+    wr.imm_data = htonl(conn->recv_msg->data.mr.imm_data);
     // wr.send_flags = IBV_SEND_SIGNALED;
 
     make_sge(&sg_list[0], srmem->data(), srmem->size(), context_->rdma_mr->lkey);
@@ -446,11 +439,6 @@ class RDMAVan : public Van {
         "= %u, sr_slots = %d, conn = %p",
         msg.meta.recver, msg.data.size(), total_length, ntohl(wr.imm_data), conn->sr_slots, conn);
 
-    conn->mu->lock();
-    conn->flag = 1;
-    conn->mu->unlock();
-    conn->cond->notify_all();
-
     while (conn->sr_slots >= kTxDepth - 1) {
     }
     conn->sr_slots++;
@@ -472,16 +460,12 @@ class RDMAVan : public Van {
       CHECK(conn->recv_msg->type == MSG_RES_REGION)
           << "receive message type != MSG_RES_REGION, " << conn->recv_msg->type;
 
-      memcpy(&conn->recv_msg_copy, conn->recv_msg, conn->recv_msg->size);
-      *conn->upintheair.msg_copy = *conn->upintheair.msg;
-      *conn->upintheair.pbmeta_copy = *conn->upintheair.pbmeta;
-
-      //conn->mu->lock();
-      //conn->flag = 1;
-      //conn->mu->unlock();
-      //conn->cond->notify_all();
-
       SendMsg2(conn);
+
+      conn->mu->lock();
+      conn->flag = 1;
+      conn->mu->unlock();
+      conn->cond->notify_all();
       return;
     }
 
@@ -708,9 +692,6 @@ class RDMAVan : public Van {
     conn->mu = new std::mutex();
     conn->cond = new std::condition_variable();
     conn->upintheair.msg = new Message();
-    conn->upintheair.msg_copy = new Message();
-    conn->upintheair.pbmeta = new PBMeta();
-    conn->upintheair.pbmeta_copy = new PBMeta();
     id->context = conn;
     conn->id = id;
     conn->connected = 0;
@@ -780,9 +761,6 @@ class RDMAVan : public Van {
     delete conn->mu;
     delete conn->cond;
     delete conn->upintheair.msg;
-    delete conn->upintheair.msg_copy;
-    delete conn->upintheair.pbmeta;
-    delete conn->upintheair.pbmeta_copy;
     free(conn);
     rdma_destroy_id(id);
     CHECK_GE(--num_connections_, 0);
