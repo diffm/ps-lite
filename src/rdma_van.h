@@ -29,7 +29,7 @@ namespace ps {
 
 #include <chrono>
 
-#define RDEBUG
+//#define RDEBUG
 
 #ifdef RDEBUG
 #define debug(format, ...)                                                             \
@@ -72,7 +72,7 @@ static inline void __inspect(const char *func, void *addr, int length) {
 #endif
 
 const int kRxDepth = 500;
-const int kTxDepth = 2;
+const int kTxDepth = 500;
 const int kSGEntry = 4;
 const int kTimeoutms = 1000;
 const int kInlineData = 4000;
@@ -142,6 +142,10 @@ struct connection {
   volatile int connected;
   int active_side;
   int max_inline_data;
+
+  std::mutex *mutex;
+  std::condition_variable *cond;
+  int flag;
 };
 
 struct send_msg_step2 {
@@ -275,6 +279,11 @@ class RDMAVan : public Van {
     struct rdma_cm_id *rdma_id = *it->second.rbegin();
     struct connection *conn = (struct connection *)rdma_id->context;
 
+    debug("before lk");
+    std::unique_lock<std::mutex> lk(*conn->mutex);
+    conn->flag = 0;
+    debug("after lk");
+
     PBMeta meta;
     PackMetaPB(msg.meta, &meta);
     uint32_t meta_size = meta.ByteSize();
@@ -326,6 +335,9 @@ class RDMAVan : public Van {
     PostSendRDMAMsg(conn, send_flags, htonl(send_queue_.size() - 1));
 
     //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    debug("before cond");
+    conn->cond->wait(lk, [this, conn]{return conn->flag == 1;});
+    debug("after cond");
     return send_bytes;
   }
 
@@ -418,6 +430,13 @@ class RDMAVan : public Van {
     // local send done
     if (wc.opcode == IBV_WC_SEND) {
       conn->sr_slots--;
+
+      debug("before mutex");
+      conn->mutex->lock();
+      conn->flag = 1;
+      conn->mutex->unlock();
+      debug("before notify all");
+      conn->cond->notify_all();
       debug("conn->sr_slots = %d\n", conn->sr_slots.load());
       return;
     }
@@ -647,6 +666,8 @@ class RDMAVan : public Van {
   void InitConnection(struct rdma_cm_id *id, bool active_side) {
     struct connection *conn = (struct connection *)malloc(sizeof(struct connection));
     // debug("struct conn constructed, conn = %p, active_side = %d", conn, int(active_side));
+    conn->mutex = new std::mutex();
+    conn->cond = new std::condition_variable();
     id->context = conn;
     conn->id = id;
     conn->connected = 0;
