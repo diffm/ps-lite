@@ -74,7 +74,7 @@ const int kRxDepth = 500;
 const int kTxDepth = 500;
 const int kSGEntry = 4;
 const int kTimeoutms = 1000;
-const int kInlineData = 4000;
+const int kInlineData = 400;
 
 enum rdma_msg_type {
   MSG_REQ_REGION = 1,
