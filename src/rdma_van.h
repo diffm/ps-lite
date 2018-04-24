@@ -70,11 +70,11 @@ static inline void __inspect(const char *func, void *addr, int length) {
 #define inspect(...)
 #endif
 
-const int kRxDepth = 40;
-const int kTxDepth = 40;
+const int kRxDepth = 500;
+const int kTxDepth = 500;
 const int kSGEntry = 4;
 const int kTimeoutms = 1000;
-const int kInlineData = 400;
+const int kInlineData = 4000;
 
 enum rdma_msg_type {
   MSG_REQ_REGION = 1,
@@ -887,9 +887,9 @@ class RDMAVan : public Van {
     sge.length = region->msg->size;
     sge.lkey = region->mr->lkey;
 
-    //while (conn->sr_slots.load() >= kTxDepth - 1) {
-    //}
-    //conn->sr_slots++;
+    while (conn->sr_slots.load() >= kTxDepth - 1) {
+    }
+    conn->sr_slots++;
     CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "send RDMA message failed with errno: "
                                                       << errno;
   }
