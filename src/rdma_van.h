@@ -28,7 +28,7 @@ namespace ps {
 
 #include <chrono>
 
-#define RDEBUG
+//#define RDEBUG
 
 #ifdef RDEBUG
 #define debug(format, ...)                                                             \
@@ -70,8 +70,8 @@ static inline void __inspect(const char *func, void *addr, int length) {
 #define inspect(...)
 #endif
 
-const int kRxDepth = 50;
-const int kTxDepth = 50;
+const int kRxDepth = 40;
+const int kTxDepth = 40;
 const int kSGEntry = 4;
 const int kTimeoutms = 1000;
 const int kInlineData = 400;
@@ -390,7 +390,13 @@ class RDMAVan : public Van {
     uint32_t meta_size = meta.ByteSize();
 
     /* the data is directly sent with RDMA_SEND */
-    if (meta_size + header_size + msg.meta.data_size <= kInlineData) return;
+    if (meta_size + header_size + msg.meta.data_size <= kInlineData) {
+      recv_region->used = 0;
+      PostRecvRDMAMsg(conn, recv_region);
+      conn->rr_slots++;
+      debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
+      return;
+    }
 
     SRMem<char> *srmem = new SRMem<char>(meta_size + header_size);
     meta.SerializeToArray(srmem->data() + header_size, meta_size);
@@ -488,8 +494,13 @@ class RDMAVan : public Van {
 
       region->used = 0;
       PostRecvRDMAMsg(conn, region);
+      conn->rr_slots++;
+      debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
       return;
     }
+
+    conn->rr_slots--;
+    debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
 
     // 这个recv_msg可能被立刻覆盖，怎么解决
     if (wc.opcode == IBV_WC_RECV) {
@@ -504,6 +515,7 @@ class RDMAVan : public Van {
       debug("send_region = %p, used = %d\n", send_region, send_region->used.load());
       send_region->used = 0;
       debug("send_region = %p, used = %d\n", send_region, send_region->used.load());
+
       return;
     }
 
@@ -553,6 +565,9 @@ class RDMAVan : public Van {
       return;
     }
 
+    conn->rr_slots--;
+    debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
+
     if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
       // it indicates that a Send Region operation has done
       // conn->sr_slots--;
@@ -565,6 +580,8 @@ class RDMAVan : public Van {
 
       region->used = 0;
       PostRecvRDMAMsg(conn, region);
+      conn->rr_slots++;
+      debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
       return;
     }
 
@@ -618,7 +635,8 @@ class RDMAVan : public Van {
 
       region->used = 0;
       PostRecvRDMAMsg(conn, region);
-      debug("conn = %p, conn->sr_slots = %d\n", conn, conn->sr_slots.load());
+      conn->rr_slots++;
+      debug("conn = %p, conn->rr_slots = %d\n", conn, conn->rr_slots.load());
       return;
     }
 
@@ -869,9 +887,9 @@ class RDMAVan : public Van {
     sge.length = region->msg->size;
     sge.lkey = region->mr->lkey;
 
-    while (conn->sr_slots.load() >= kTxDepth - 1) {
-    }
-    conn->sr_slots++;
+    //while (conn->sr_slots.load() >= kTxDepth - 1) {
+    //}
+    //conn->sr_slots++;
     CHECK(ibv_post_send(conn->qp, &wr, &bad_wr) == 0) << "send RDMA message failed with errno: "
                                                       << errno;
   }
