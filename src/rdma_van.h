@@ -93,7 +93,8 @@ struct rdma_write_header {
   int sender;
   int recver;
   int length[5];
-};
+  int self_size;
+} __attribute__ ((packed));
 
 struct rdma_msg {
   /* rdma_msg_type */
@@ -310,7 +311,7 @@ class RDMAVan : public Van {
       conn->send_msg->data.length[i + 1] = msg.data[i].size();
     conn->send_msg->data.length[msg.data.size() + 1] = -1;
 
-    const size_t header_size = sizeof(struct rdma_write_header);
+    size_t header_size = (sizeof(struct rdma_write_header) + meta_size + 7) / 8 * 8 - meta_size;
     if (header_size + send_bytes <= kInlineData) {
       /* use send and recv region to transfer data */
       conn->send_msg->type |= MSG_INLINE_DATA;
@@ -321,10 +322,11 @@ class RDMAVan : public Van {
       header->sender = my_node_.id;
       header->recver = recver_id;
       header->length[0] = meta_size;
+      header->self_size = header_size;
       for (size_t i = 0; i < msg.data.size(); i++) header->length[i + 1] = msg.data[i].size();
       header->length[msg.data.size() + 1] = -1;
       /* fill meta */
-      char *addr = (char *)header + sizeof(struct rdma_write_header);
+      char *addr = (char *)header + header_size;
       meta.SerializeToArray(addr, meta_size);
       /* fill data */
       addr += meta_size;
@@ -363,12 +365,11 @@ class RDMAVan : public Van {
   void SendMsg2(struct connection *conn) {
     /* 3. Send the data using RDMA_WRITE_WITH_IMM */
 
-    const size_t header_size = sizeof(struct rdma_write_header);
-
     Message &msg = *conn->upintheair.msg;
     PBMeta meta;
     PackMetaPB(msg.meta, &meta);
     uint32_t meta_size = meta.ByteSize();
+    size_t header_size = (sizeof(struct rdma_write_header) + meta_size + 7) / 8 * 8 - meta_size;
 
     /* the data is directly sent with RDMA_SEND */
     if (meta_size + header_size + msg.meta.data_size <= kInlineData)
@@ -384,6 +385,7 @@ class RDMAVan : public Van {
     header->sender = my_node_.id;
     header->recver = msg.meta.recver;
     header->length[0] = meta_size;
+    header->self_size = header_size;
 
     inspect(srmem->data(), srmem->size());
 
@@ -571,7 +573,7 @@ class RDMAVan : public Van {
       conn->send_msg->type = MSG_RES_REGION;
       auto &data = conn->recv_msg->data;
 
-      int total_length = sizeof(struct rdma_write_header);
+      int total_length = sizeof(struct rdma_write_header) + 8;
       for (int i = 0, length; (length = data.length[i]) != -1; i++) {
         total_length += length;
       }
@@ -642,7 +644,7 @@ class RDMAVan : public Van {
     msg->meta.sender = header->sender;
     msg->meta.recver = my_node_.id;
 
-    addr = static_cast<char *>(addr) + sizeof(*header);
+    addr = static_cast<char *>(addr) + header->self_size;
     UnpackMeta(static_cast<char *>(addr), header->length[0], &msg->meta);
 
     recv_bytes += header->length[0];
